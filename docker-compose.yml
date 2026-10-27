@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - recruiterreach-data:/app/data
+    environment:
+      DATABASE_URL: sqlite:////app/data/recruiterreach.db
+      FRONTEND_ORIGIN: http://localhost:3000
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+volumes:
+  recruiterreach-data:
