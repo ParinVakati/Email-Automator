@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "RecruiterReach",
-  description: "Private, approval-first recruiter outreach workspace",
+  description: "A private, thoughtful recruiter outreach workspace.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

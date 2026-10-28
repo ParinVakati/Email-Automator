@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -47,6 +47,7 @@ class Campaign(Base):
     __tablename__ = "campaigns"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str | None] = mapped_column(String(255), index=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("job_postings.id"), index=True)
     requested_count: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
@@ -82,3 +83,27 @@ class Suppression(Base):
     email_normalized: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     reason: Mapped[str] = mapped_column(String(255), default="opt_out")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    account_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    university: Mapped[str] = mapped_column(String(255), default="")
+    background: Mapped[str] = mapped_column(String(1000), default="")
+    skills: Mapped[list[str]] = mapped_column(JSON, default=list)
+    portfolio_url: Mapped[str | None] = mapped_column(String(2048))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UserActivity(Base):
+    __tablename__ = "user_activity"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(255), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    summary: Mapped[str] = mapped_column(String(500))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

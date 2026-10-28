@@ -41,7 +41,7 @@ class VerifyRequest(BaseModel):
 
 
 class ProfileInput(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(default="", max_length=255)
     university: str = Field(default="", max_length=255)
     background: str = Field(default="", max_length=1000)
     skills: list[str] = Field(default_factory=list, max_length=30)
@@ -90,4 +90,6 @@ class CampaignOut(BaseModel):
     job_id: int
     requested_count: int
     status: str
+    created_at: str
+    job: JobOut | None = None
     recipients: list[RecipientOut] = []

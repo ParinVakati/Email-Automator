@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main
+from app.auth import require_auth
 from app.config import settings
 from app.database import Base
 from app.models import JobPosting
@@ -22,7 +23,8 @@ def make_client(monkeypatch):
             db.close()
 
     main.app.dependency_overrides[main.get_db] = override_db
-    monkeypatch.setattr(settings, "app_access_token", "test-token")
+    main.app.dependency_overrides[require_auth] = lambda: "account-a"
+    monkeypatch.setattr(settings, "supabase_url", "https://example.supabase.co")
     monkeypatch.setattr(settings, "max_campaign_recipients", 2)
     with test_session() as db:
         db.add(JobPosting(url="https://example.com/job", title="Engineer", company="Example", company_domain="example.com", description="Python"))
@@ -41,8 +43,10 @@ def test_campaign_rejects_request_over_configured_limit(monkeypatch):
 
 def test_campaign_creation_requires_auth_and_persists(monkeypatch):
     client, job_id, engine = make_client(monkeypatch)
+    main.app.dependency_overrides.pop(require_auth)
     assert client.post("/api/campaigns", json={"job_id": job_id, "requested_count": 2}).status_code == 401
-    response = client.post("/api/campaigns", headers={"Authorization": "Bearer test-token"}, json={"job_id": job_id, "requested_count": 2})
+    main.app.dependency_overrides[require_auth] = lambda: "account-a"
+    response = client.post("/api/campaigns", json={"job_id": job_id, "requested_count": 2})
     assert response.status_code == 200
     assert response.json()["requested_count"] == 2
     main.app.dependency_overrides.clear()
@@ -51,7 +55,7 @@ def test_campaign_creation_requires_auth_and_persists(monkeypatch):
 
 def test_campaign_draft_edit_is_persisted_before_approval(monkeypatch):
     client, job_id, engine = make_client(monkeypatch)
-    auth = {"Authorization": "Bearer test-token"}
+    auth = {}
     monkeypatch.setattr(settings, "hunter_api_key", "test-hunter-key")
     created = client.post("/api/campaigns", headers=auth, json={"job_id": job_id, "requested_count": 1}).json()
     campaign_id = created["id"]
@@ -106,5 +110,39 @@ def test_campaign_draft_edit_is_persisted_before_approval(monkeypatch):
     launch = client.post(f"/api/campaigns/{campaign_id}/launch", headers=auth)
     assert launch.status_code == 503
     assert "no emails were sent" in launch.json()["detail"]
+    main.app.dependency_overrides.clear()
+    engine.dispose()
+
+
+def test_campaigns_profiles_and_activity_are_account_scoped(monkeypatch):
+    client, job_id, engine = make_client(monkeypatch)
+    created = client.post("/api/campaigns", json={"job_id": job_id, "requested_count": 1})
+    assert created.status_code == 200
+    campaign_id = created.json()["id"]
+    profile_response = client.put(
+        "/api/profile",
+        json={"name": "Casey Candidate", "university": "Example University", "background": "CS student", "skills": ["Python"]},
+    )
+    assert profile_response.status_code == 200
+    assert profile_response.json()["name"] == "Casey Candidate"
+    activity = client.get("/api/activity")
+    assert activity.status_code == 200
+    assert {item["type"] for item in activity.json()} >= {"campaign_created", "profile_updated"}
+
+    main.app.dependency_overrides[require_auth] = lambda: "account-b"
+    assert client.get("/api/campaigns").json() == []
+    assert client.get(f"/api/campaigns/{campaign_id}").status_code == 404
+    assert client.get("/api/profile").json()["name"] == ""
+    assert client.get("/api/activity").json() == []
+    main.app.dependency_overrides.clear()
+    engine.dispose()
+
+
+def test_campaign_list_and_analytics_only_include_authenticated_account(monkeypatch):
+    client, job_id, engine = make_client(monkeypatch)
+    client.post("/api/campaigns", json={"job_id": job_id, "requested_count": 1})
+    assert client.get("/api/analytics").json()["campaigns"] == 1
+    main.app.dependency_overrides[require_auth] = lambda: "different-account"
+    assert client.get("/api/analytics").json()["campaigns"] == 0
     main.app.dependency_overrides.clear()
     engine.dispose()

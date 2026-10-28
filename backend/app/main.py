@@ -10,12 +10,13 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.auth import require_auth
 from app.config import settings
-from app.database import Base, SessionLocal, engine
+from app.database import Base, SessionLocal, engine, migrate_schema
 from app.job_analysis import extract_job, fetch_public_page
-from app.models import Campaign, CampaignRecipient, JobPosting, Recruiter, Suppression
-from app.schemas import AddRecipients, CampaignCreate, CampaignOut, GenerateRequest, JobAnalyzeRequest, JobOut, RecruiterOut, SaveDrafts, VerifyRequest
+from app.models import Campaign, CampaignRecipient, JobPosting, Recruiter, Suppression, UserActivity, UserProfile
+from app.schemas import AddRecipients, CampaignCreate, CampaignOut, GenerateRequest, JobAnalyzeRequest, JobOut, ProfileInput, RecruiterOut, SaveDrafts, VerifyRequest
 
 Base.metadata.create_all(bind=engine)
+migrate_schema()
 app = FastAPI(title="RecruiterReach API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -46,7 +47,8 @@ def _job_output(job: JobPosting, cached: bool = False) -> dict:
 def _campaign_output(campaign: Campaign) -> dict:
     return {
         "id": campaign.id, "job_id": campaign.job_id, "requested_count": campaign.requested_count,
-        "status": campaign.status, "recipients": [
+        "status": campaign.status, "created_at": campaign.created_at.isoformat(),
+        "job": _job_output(campaign.job) if campaign.job else None, "recipients": [
             {"id": item.id, "recruiter_id": item.recruiter_id, "status": item.status, "subject": item.subject,
              "body": item.body, "recruiter": RecruiterOut.model_validate(item.recruiter).model_dump()}
             for item in campaign.recipients
@@ -54,9 +56,27 @@ def _campaign_output(campaign: Campaign) -> dict:
     }
 
 
-def _load_campaign(db: Session, campaign_id: int) -> Campaign:
+def _record_activity(
+    db: Session,
+    account_id: str,
+    event_type: str,
+    summary: str,
+    details: dict | None = None,
+    campaign_id: int | None = None,
+) -> None:
+    db.add(UserActivity(
+        account_id=account_id,
+        event_type=event_type,
+        summary=summary,
+        details=details or {},
+        campaign_id=campaign_id,
+    ))
+
+
+def _load_campaign(db: Session, campaign_id: int, account_id: str) -> Campaign:
     campaign = db.execute(
-        select(Campaign).where(Campaign.id == campaign_id).options(
+        select(Campaign).where(Campaign.id == campaign_id, Campaign.account_id == account_id).options(
+            joinedload(Campaign.job),
             joinedload(Campaign.recipients).joinedload(CampaignRecipient.recruiter)
         )
     ).unique().scalar_one_or_none()
@@ -70,11 +90,13 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/api/jobs/analyze", response_model=JobOut, dependencies=[Depends(require_auth)])
-async def analyze_job(payload: JobAnalyzeRequest, db: Session = Depends(get_db)):
+@app.post("/api/jobs/analyze", response_model=JobOut)
+async def analyze_job(payload: JobAnalyzeRequest, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     url = str(payload.url)
     existing = db.scalar(select(JobPosting).where(JobPosting.url == url))
     if existing:
+        _record_activity(db, account_id, "job_analyzed", f"Reviewed job posting: {existing.title or existing.url}", {"job_id": existing.id, "url": url})
+        db.commit()
         return _job_output(existing, cached=True)
     html = await fetch_public_page(url)
     parsed = extract_job(url, html)
@@ -88,42 +110,47 @@ async def analyze_job(payload: JobAnalyzeRequest, db: Session = Depends(get_db))
         if not job:
             raise HTTPException(status_code=409, detail="Job posting was concurrently saved")
     db.refresh(job)
+    _record_activity(db, account_id, "job_analyzed", f"Analyzed job posting: {job.title or job.url}", {"job_id": job.id, "url": url})
+    db.commit()
     return _job_output(job)
 
 
-@app.post("/api/campaigns", response_model=CampaignOut, dependencies=[Depends(require_auth)])
-def create_campaign(payload: CampaignCreate, db: Session = Depends(get_db)):
+@app.post("/api/campaigns", response_model=CampaignOut)
+def create_campaign(payload: CampaignCreate, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     if payload.requested_count > settings.max_campaign_recipients:
         raise HTTPException(status_code=422, detail=f"Requested count exceeds configured limit ({settings.max_campaign_recipients})")
     if not db.get(JobPosting, payload.job_id):
         raise HTTPException(status_code=404, detail="Job posting not found")
-    campaign = Campaign(job_id=payload.job_id, requested_count=payload.requested_count)
+    campaign = Campaign(account_id=account_id, job_id=payload.job_id, requested_count=payload.requested_count)
     db.add(campaign)
     db.commit()
     db.refresh(campaign)
-    return _campaign_output(_load_campaign(db, campaign.id))
+    _record_activity(db, account_id, "campaign_created", "Started a new outreach campaign", {"job_id": payload.job_id}, campaign.id)
+    db.commit()
+    return _campaign_output(_load_campaign(db, campaign.id, account_id))
 
 
-@app.get("/api/campaigns", dependencies=[Depends(require_auth)])
-def list_campaigns(db: Session = Depends(get_db)):
-    campaigns = db.scalars(select(Campaign).options(joinedload(Campaign.recipients).joinedload(CampaignRecipient.recruiter)).order_by(Campaign.created_at.desc())).unique().all()
+@app.get("/api/campaigns")
+def list_campaigns(account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaigns = db.scalars(select(Campaign).where(Campaign.account_id == account_id).options(joinedload(Campaign.job), joinedload(Campaign.recipients).joinedload(CampaignRecipient.recruiter)).order_by(Campaign.created_at.desc())).unique().all()
     return [_campaign_output(campaign) for campaign in campaigns]
 
 
-@app.get("/api/campaigns/{campaign_id}", dependencies=[Depends(require_auth)])
-def get_campaign(campaign_id: int, db: Session = Depends(get_db)):
-    return _campaign_output(_load_campaign(db, campaign_id))
+@app.get("/api/campaigns/{campaign_id}")
+def get_campaign(campaign_id: int, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    return _campaign_output(_load_campaign(db, campaign_id, account_id))
 
 
-@app.post("/api/campaigns/{campaign_id}/recruiters", response_model=CampaignOut, dependencies=[Depends(require_auth)])
-def add_recruiters(campaign_id: int, payload: AddRecipients, db: Session = Depends(get_db)):
-    campaign = _load_campaign(db, campaign_id)
+@app.post("/api/campaigns/{campaign_id}/recruiters", response_model=CampaignOut)
+def add_recruiters(campaign_id: int, payload: AddRecipients, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaign = _load_campaign(db, campaign_id, account_id)
     if campaign.status not in {"draft"}:
         raise HTTPException(status_code=409, detail="Recipients can only be changed on a draft campaign")
     current_ids = {item.recruiter_id for item in campaign.recipients}
     remaining = min(campaign.requested_count, settings.max_campaign_recipients) - len(current_ids)
     if len(payload.recruiters) > remaining:
         raise HTTPException(status_code=422, detail=f"Campaign has room for only {max(remaining, 0)} more recipient(s)")
+    initial_count = len(current_ids)
     for candidate in payload.recruiters:
         email = str(candidate.email).lower().strip()
         if db.scalar(select(Suppression.id).where(Suppression.email_normalized == email)):
@@ -141,17 +168,26 @@ def add_recruiters(campaign_id: int, payload: AddRecipients, db: Session = Depen
             db.add(CampaignRecipient(campaign=campaign, recruiter=recruiter))
             current_ids.add(recruiter.id)
     db.commit()
-    return _campaign_output(_load_campaign(db, campaign_id))
+    added_count = len(current_ids) - initial_count
+    _record_activity(db, account_id, "contacts_added", f"Added {added_count} recruiter contact(s)", {"campaign_id": campaign_id, "count": added_count}, campaign_id)
+    db.commit()
+    return _campaign_output(_load_campaign(db, campaign_id, account_id))
 
 
-@app.post("/api/recruiters/verify", dependencies=[Depends(require_auth)])
-async def verify_recruiters(payload: VerifyRequest, db: Session = Depends(get_db)):
+@app.post("/api/recruiters/verify")
+async def verify_recruiters(payload: VerifyRequest, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     if not settings.hunter_api_key:
         raise HTTPException(status_code=503, detail="Email verification requires a configured Hunter API key")
     if len(set(payload.recruiter_ids)) != len(payload.recruiter_ids):
         raise HTTPException(status_code=422, detail="Recruiter IDs must be unique")
-    recruiters = [db.get(Recruiter, recruiter_id) for recruiter_id in payload.recruiter_ids]
-    if any(recruiter is None for recruiter in recruiters):
+    recruiters = db.scalars(
+        select(Recruiter)
+        .join(CampaignRecipient, CampaignRecipient.recruiter_id == Recruiter.id)
+        .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
+        .where(Campaign.account_id == account_id, Recruiter.id.in_(payload.recruiter_ids))
+        .distinct()
+    ).all()
+    if len(recruiters) != len(set(payload.recruiter_ids)):
         raise HTTPException(status_code=404, detail="One or more recruiter records were not found")
     statuses = []
     try:
@@ -175,11 +211,13 @@ async def verify_recruiters(payload: VerifyRequest, db: Session = Depends(get_db
     return {"results": statuses}
 
 
-@app.post("/api/campaigns/{campaign_id}/generate", response_model=CampaignOut, dependencies=[Depends(require_auth)])
-def generate_emails(campaign_id: int, payload: GenerateRequest, db: Session = Depends(get_db)):
-    campaign = _load_campaign(db, campaign_id)
+@app.post("/api/campaigns/{campaign_id}/generate", response_model=CampaignOut)
+def generate_emails(campaign_id: int, payload: GenerateRequest, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaign = _load_campaign(db, campaign_id, account_id)
     if campaign.status != "draft":
         raise HTTPException(status_code=409, detail="Emails can only be generated for a draft campaign")
+    if not payload.profile.name.strip():
+        raise HTTPException(status_code=422, detail="Your name is required to generate email drafts")
     job = db.get(JobPosting, campaign.job_id)
     for item in campaign.recipients:
         if item.status != "draft":
@@ -207,12 +245,14 @@ def generate_emails(campaign_id: int, payload: GenerateRequest, db: Session = De
         item.subject = subject[:998]
         item.body = body
     db.commit()
-    return _campaign_output(_load_campaign(db, campaign_id))
+    _record_activity(db, account_id, "drafts_generated", f"Generated {len(campaign.recipients)} editable email draft(s)", {"campaign_id": campaign_id}, campaign_id)
+    db.commit()
+    return _campaign_output(_load_campaign(db, campaign_id, account_id))
 
 
-@app.post("/api/campaigns/{campaign_id}/approve", response_model=CampaignOut, dependencies=[Depends(require_auth)])
-def approve_campaign(campaign_id: int, db: Session = Depends(get_db)):
-    campaign = _load_campaign(db, campaign_id)
+@app.post("/api/campaigns/{campaign_id}/approve", response_model=CampaignOut)
+def approve_campaign(campaign_id: int, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaign = _load_campaign(db, campaign_id, account_id)
     if campaign.status != "draft" or not campaign.recipients:
         raise HTTPException(status_code=409, detail="A draft campaign with recipients is required")
     eligible = [r for r in campaign.recipients if r.subject and r.body and not r.recruiter.opted_out and r.recruiter.verification_status == "valid"]
@@ -224,12 +264,14 @@ def approve_campaign(campaign_id: int, db: Session = Depends(get_db)):
     for recipient in eligible:
         recipient.status = "approved"
     db.commit()
-    return _campaign_output(_load_campaign(db, campaign_id))
+    _record_activity(db, account_id, "campaign_approved", "Approved campaign emails for review", {"campaign_id": campaign_id}, campaign_id)
+    db.commit()
+    return _campaign_output(_load_campaign(db, campaign_id, account_id))
 
 
-@app.post("/api/campaigns/{campaign_id}/drafts", response_model=CampaignOut, dependencies=[Depends(require_auth)])
-def save_drafts(campaign_id: int, payload: SaveDrafts, db: Session = Depends(get_db)):
-    campaign = _load_campaign(db, campaign_id)
+@app.post("/api/campaigns/{campaign_id}/drafts", response_model=CampaignOut)
+def save_drafts(campaign_id: int, payload: SaveDrafts, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaign = _load_campaign(db, campaign_id, account_id)
     if campaign.status != "draft":
         raise HTTPException(status_code=409, detail="Only draft campaigns can be edited")
     recipients = {item.id: item for item in campaign.recipients}
@@ -242,19 +284,23 @@ def save_drafts(campaign_id: int, payload: SaveDrafts, db: Session = Depends(get
         recipient.subject = update.subject.strip()
         recipient.body = update.body.strip()
     db.commit()
-    return _campaign_output(_load_campaign(db, campaign_id))
+    _record_activity(db, account_id, "drafts_updated", f"Edited {len(payload.recipients)} email draft(s)", {"campaign_id": campaign_id}, campaign_id)
+    db.commit()
+    return _campaign_output(_load_campaign(db, campaign_id, account_id))
 
 
-@app.post("/api/campaigns/{campaign_id}/launch", dependencies=[Depends(require_auth)])
-def launch_campaign(campaign_id: int, db: Session = Depends(get_db)):
-    campaign = _load_campaign(db, campaign_id)
+@app.post("/api/campaigns/{campaign_id}/launch")
+def launch_campaign(campaign_id: int, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaign = _load_campaign(db, campaign_id, account_id)
     if campaign.status != "approved":
         raise HTTPException(status_code=409, detail="Campaign must be approved before launch")
     raise HTTPException(status_code=503, detail="Gmail OAuth and the durable send worker are not configured in this build; no emails were sent")
 
 
-@app.post("/api/recruiters/discover", dependencies=[Depends(require_auth)])
-async def discover_recruiters(job_id: int, db: Session = Depends(get_db)):
+@app.post("/api/recruiters/discover")
+async def discover_recruiters(job_id: int, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    if not db.scalar(select(Campaign.id).where(Campaign.account_id == account_id, Campaign.job_id == job_id)):
+        raise HTTPException(status_code=404, detail="Create a campaign for this job before discovering contacts")
     job = db.get(JobPosting, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job posting not found")
@@ -311,21 +357,28 @@ async def discover_recruiters(job_id: int, db: Session = Depends(get_db)):
     return {"recruiters": results, "count": len(results), "requested_maximum": campaign_limit}
 
 
-@app.post("/api/recruiters/{recruiter_id}/opt-out", dependencies=[Depends(require_auth)])
-def opt_out_recruiter(recruiter_id: int, db: Session = Depends(get_db)):
-    recruiter = db.get(Recruiter, recruiter_id)
-    if not recruiter:
+@app.post("/api/recruiters/{recruiter_id}/opt-out")
+def opt_out_recruiter(recruiter_id: int, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    recruiter = db.scalar(
+        select(Recruiter)
+        .join(CampaignRecipient, CampaignRecipient.recruiter_id == Recruiter.id)
+        .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
+        .where(Recruiter.id == recruiter_id, Campaign.account_id == account_id)
+    )
+    if recruiter is None:
         raise HTTPException(status_code=404, detail="Recruiter not found")
     recruiter.opted_out = True
     if not db.scalar(select(Suppression.id).where(Suppression.email_normalized == recruiter.email_normalized)):
         db.add(Suppression(email_normalized=recruiter.email_normalized, reason="opt_out"))
     db.commit()
+    _record_activity(db, account_id, "contact_opted_out", f"Suppressed {recruiter.email} from future outreach", {"recruiter_id": recruiter_id})
+    db.commit()
     return {"status": "opted_out"}
 
 
-@app.get("/api/analytics", dependencies=[Depends(require_auth)])
-def analytics(db: Session = Depends(get_db)):
-    campaigns = db.scalars(select(Campaign).options(joinedload(Campaign.recipients))).unique().all()
+@app.get("/api/analytics")
+def analytics(account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    campaigns = db.scalars(select(Campaign).where(Campaign.account_id == account_id).options(joinedload(Campaign.recipients))).unique().all()
     recipients = [recipient for campaign in campaigns for recipient in campaign.recipients]
     sent = sum(recipient.status == "sent" for recipient in recipients)
     replied = sum(recipient.status == "replied" for recipient in recipients)
@@ -334,3 +387,57 @@ def analytics(db: Session = Depends(get_db)):
         "response_rate": replied / sent if sent else 0,
         "note": "Send and reply totals remain zero until Gmail integration is configured.",
     }
+
+
+@app.get("/api/profile")
+def get_profile(account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    profile = db.get(UserProfile, account_id)
+    if profile is None:
+        return {"name": "", "university": "", "background": "", "skills": [], "portfolio_url": None}
+    return {
+        "name": profile.name,
+        "university": profile.university,
+        "background": profile.background,
+        "skills": profile.skills,
+        "portfolio_url": profile.portfolio_url,
+    }
+
+
+@app.put("/api/profile")
+def save_profile(payload: ProfileInput, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    profile = db.get(UserProfile, account_id)
+    if profile is None:
+        profile = UserProfile(account_id=account_id)
+        db.add(profile)
+    profile.name = payload.name.strip()
+    profile.university = payload.university.strip()
+    profile.background = payload.background.strip()
+    profile.skills = payload.skills
+    profile.portfolio_url = str(payload.portfolio_url) if payload.portfolio_url else None
+    db.commit()
+    _record_activity(db, account_id, "profile_updated", "Updated personal profile")
+    db.commit()
+    return get_profile(account_id, db)
+
+
+@app.get("/api/activity")
+def get_activity(limit: int = 50, account_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="Activity limit must be between 1 and 100")
+    activities = db.scalars(
+        select(UserActivity)
+        .where(UserActivity.account_id == account_id)
+        .order_by(UserActivity.created_at.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": item.id,
+            "type": item.event_type,
+            "summary": item.summary,
+            "details": item.details,
+            "campaign_id": item.campaign_id,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in activities
+    ]
